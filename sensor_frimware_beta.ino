@@ -9,12 +9,15 @@
 #define AP_SSID "ESP_Config"
 #define AP_PASS "12345678"
 #define EEPROM_SIZE 512
+#define DEFAULT_PORT "3000" 
 
 // Структура для хранения настроек
 struct Config {
   char wifiSSID[32];
   char wifiPass[64];
   char sensorId[32];
+  char serverIP[40];
+  char serverPort[6];  // Поле для порта (до 5 символов)
 };
 
 Config config;
@@ -62,6 +65,9 @@ const char sensorConfigPage[] PROGMEM = R"rawliteral(
     .container { max-width: 500px; margin: auto; }
     input, select { width: 100%; padding: 10px; margin: 8px 0; box-sizing: border-box; }
     button { background: #4CAF50; color: white; padding: 12px; border: none; width: 100%; }
+    .server-addr { display: flex; gap: 10px; }
+    .server-addr input:first-child { flex: 3; }
+    .server-addr input:last-child { flex: 1; }
   </style>
 </head>
 <body>
@@ -69,8 +75,10 @@ const char sensorConfigPage[] PROGMEM = R"rawliteral(
     <h2>Регистрация датчика</h2>
     <form method="post" action="/saveSensor">
       <h3>Сервер</h3>
-      <input type="text" name="serverIP" placeholder="IP или Домен сервера" required>
-      
+      <div class="server-addr">
+        <input type="text" name="serverIP" placeholder="IP или Домен сервера" required>
+        <input type="text" name="serverPort" placeholder="Порт сервера" value="3000" required>
+      </div>
       <h3>Аутентификация</h3>
       <input type="text" name="authUser" placeholder="Логин" required>
       <input type="password" name="authPass" placeholder="Пароль" required>
@@ -87,6 +95,7 @@ const char sensorConfigPage[] PROGMEM = R"rawliteral(
 </body>
 </html>
 )rawliteral";
+
 
 const char successPage[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
@@ -137,6 +146,11 @@ void loadConfig() {
   EEPROM.get(0, config);
   EEPROM.end();
   wifiConfigured = (strlen(config.wifiSSID) > 0);
+  
+  // Установка порта по умолчанию если не задан
+  if (strlen(config.serverPort) == 0) {
+    strlcpy(config.serverPort, DEFAULT_PORT, sizeof(config.serverPort));
+  }
 }
 
 void saveConfig() {
@@ -146,7 +160,6 @@ void saveConfig() {
   EEPROM.end();
   wifiConfigured = true;
 }
-
 void connectToWiFi() {
   if (wifiConfigured) {
     WiFi.begin(config.wifiSSID, config.wifiPass);
@@ -169,16 +182,24 @@ void connectToWiFi() {
   }
 }
 
-void registerSensor(String serverIP, String authUser, String authPass, 
+void registerSensor(String serverIP, String serverPort, String authUser, String authPass, 
                    String sensorId, int scaleId, String sensorName, String locationName) {
   if (WiFi.status() != WL_CONNECTED) {
     showErrorPage("Нет подключения к Wi-Fi");
     return;
   }
 
+  // Сохраняем конфигурацию
+  strlcpy(config.serverIP, serverIP.c_str(), sizeof(config.serverIP));
+  strlcpy(config.serverPort, serverPort.c_str(), sizeof(config.serverPort));
+  saveConfig();
+
+  // Формируем URL с портом
+  String authUrl = "http://" + serverIP + ":" + serverPort + "/auth/login";
+  String sensorUrl = "http://" + serverIP + ":" + serverPort + "/sensors";
+
   // Авторизация
   HTTPClient authClient;
-  String authUrl = "http://" + serverIP + "/auth/login";
   authClient.begin(wifiClient, authUrl);
   authClient.addHeader("Content-Type", "application/json");
   
@@ -188,33 +209,28 @@ void registerSensor(String serverIP, String authUser, String authPass,
   
   String authPayload;
   serializeJson(authDoc, authPayload);
-  Serial.println("Отправляем: " + authPayload);
   
   int authCode = authClient.POST(authPayload);
   
   if (authCode != 201) {
-    String errorMsg = "Ошибка авторизации. Код: " + String(authCode);
-    if (authCode > 0) {
-      errorMsg += "<br>Ответ сервера: " + authClient.getString();
-    }
+    String response = authCode > 0 ? authClient.getString() : "";
     authClient.end();
-    showErrorPage(errorMsg);
+    showErrorPage("Ошибка авторизации. Код: " + String(authCode) + 
+                 (response.length() ? "<br>" + response : ""));
     return;
   }
   
   String response = authClient.getString();
+  authClient.end();
+
   DynamicJsonDocument jsonDoc(512);
   DeserializationError error = deserializeJson(jsonDoc, response);
-  
   if (error) {
-    authClient.end();
     showErrorPage("Ошибка формата ответа сервера");
     return;
   }
   
   String token = jsonDoc["access_token"].as<String>();
-  authClient.end();
-
   if (token.length() == 0) {
     showErrorPage("Не удалось получить токен авторизации");
     return;
@@ -222,8 +238,7 @@ void registerSensor(String serverIP, String authUser, String authPass,
 
   // Регистрация датчика
   HTTPClient http;
-  String url = "http://" + serverIP + "/sensors";
-  http.begin(wifiClient, url);
+  http.begin(wifiClient, sensorUrl);
   http.addHeader("Content-Type", "application/json");
   http.addHeader("Authorization", "Bearer " + token);
   
@@ -236,20 +251,17 @@ void registerSensor(String serverIP, String authUser, String authPass,
   
   String payload;
   serializeJson(doc, payload);
-  Serial.println("Отправляем данные датчика: " + payload);
   
   int httpCode = http.POST(payload);
-  
+  String sensorResponse = httpCode > 0 ? http.getString() : "";
+  http.end();
+
   if (httpCode == HTTP_CODE_OK || httpCode == 201) {
     server.send(200, "text/html", successPage);
   } else {
-    String errorMsg = "Ошибка регистрации. Код: " + String(httpCode);
-    if (httpCode > 0) {
-      errorMsg += "<br>Ответ сервера: " + http.getString();
-    }
-    showErrorPage(errorMsg);
+    showErrorPage("Ошибка регистрации. Код: " + String(httpCode) + 
+                 (sensorResponse.length() ? "<br>" + sensorResponse : ""));
   }
-  http.end();
 }
 
 void handleRoot() {
@@ -291,6 +303,7 @@ void handleSaveWifi() {
 
 void handleSaveSensor() {
   String serverIP = server.arg("serverIP");
+  String serverPort = server.arg("serverPort");
   String authUser = server.arg("authUser");
   String authPass = server.arg("authPass");
   String sensorId = server.arg("sensorId");
@@ -299,20 +312,21 @@ void handleSaveSensor() {
   String locationName = server.arg("locationName");
 
   // Проверка обязательных полей
-  if (serverIP.length() == 0 || authUser.length() == 0 || authPass.length() == 0 || sensorId.length() == 0) {
+  if (serverIP.isEmpty() || serverPort.isEmpty() || authUser.isEmpty() || 
+      authPass.isEmpty() || sensorId.isEmpty()) {
     showErrorPage("Заполните все обязательные поля");
     return;
   }
 
+  // Сохраняем и регистрируем
   strlcpy(config.sensorId, sensorId.c_str(), sizeof(config.sensorId));
-  saveConfig();
-
-  registerSensor(serverIP, authUser, authPass, sensorId, scaleId, sensorName, locationName);
+  registerSensor(serverIP, serverPort, authUser, authPass, 
+                sensorId, scaleId, sensorName, locationName);
 }
+
 
 void setup() {
   Serial.begin(115200);
-  delay(1000);
   
   loadConfig();
   
