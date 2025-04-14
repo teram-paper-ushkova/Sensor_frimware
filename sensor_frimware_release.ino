@@ -18,9 +18,10 @@
 struct Config {
   char wifiSSID[32];
   char wifiPass[64];
-  char sensorId[32];
+  char tempSensorId[32];    // ID датчика температуры
+  char humiditySensorId[32]; // ID датчика влажности
   char serverIP[40];
-  char serverPort[6];  // Поле для порта (до 5 символов)
+  char serverPort[6];
 };
 
 Config config;
@@ -75,6 +76,8 @@ const char sensorConfigPage[] PROGMEM = R"rawliteral(
     .server-addr { display: flex; gap: 10px; }
     .server-addr input:first-child { flex: 3; }
     .server-addr input:last-child { flex: 1; }
+    .sensor-group { background: #f5f5f5; padding: 15px; margin: 15px 0; border-radius: 5px; }
+    .sensor-group h3 { margin-top: 0; }
   </style>
 </head>
 <body>
@@ -90,10 +93,20 @@ const char sensorConfigPage[] PROGMEM = R"rawliteral(
       <input type="text" name="authUser" placeholder="Логин" required>
       <input type="password" name="authPass" placeholder="Пароль" required>
       
-      <h3>Данные датчика</h3>
-      <input type="text" name="sensorId" placeholder="ID датчика" required>
-      <input type="number" name="scaleId" placeholder="ID шкалы" required>
-      <input type="text" name="sensorName" placeholder="Название">
+      <div class="sensor-group">
+        <h3>Датчик температуры</h3>
+        <input type="text" name="tempSensorId" placeholder="ID датчика температуры" required>
+        <input type="number" name="tempScaleId" placeholder="ID шкалы температуры" required>
+      </div>
+      
+      <div class="sensor-group">
+        <h3>Датчик влажности</h3>
+        <input type="text" name="humiditySensorId" placeholder="ID датчика влажности" required>
+        <input type="number" name="humidityScaleId" placeholder="ID шкалы влажности" required>
+      </div>
+      
+      <h3>Общая информация</h3>
+      <input type="text" name="sensorName" placeholder="Название системы">
       <input type="text" name="locationName" placeholder="Местоположение">
       
       <button type="submit">Зарегистрировать</button>
@@ -313,34 +326,51 @@ void handleSaveSensor() {
   String serverPort = server.arg("serverPort");
   String authUser = server.arg("authUser");
   String authPass = server.arg("authPass");
-  String sensorId = server.arg("sensorId");
-  int scaleId = server.arg("scaleId").toInt();
+  String tempSensorId = server.arg("tempSensorId");
+  int tempScaleId = server.arg("tempScaleId").toInt();
+  String humiditySensorId = server.arg("humiditySensorId");
+  int humidityScaleId = server.arg("humidityScaleId").toInt();
   String sensorName = server.arg("sensorName");
   String locationName = server.arg("locationName");
 
   // Проверка обязательных полей
   if (serverIP.isEmpty() || serverPort.isEmpty() || authUser.isEmpty() || 
-      authPass.isEmpty() || sensorId.isEmpty()) {
+      authPass.isEmpty() || tempSensorId.isEmpty() || humiditySensorId.isEmpty()) {
     showErrorPage("Заполните все обязательные поля");
     return;
   }
+  //Проверка на уникальность ID датчиков
+  if(tempSensorId == humiditySensorId){
+    showErrorPage("ID датчиков не уникальны");
+    return;
+  }
+  // Сохраняем конфигурацию
+  strlcpy(config.tempSensorId, tempSensorId.c_str(), sizeof(config.tempSensorId));
+  strlcpy(config.humiditySensorId, humiditySensorId.c_str(), sizeof(config.humiditySensorId));
+  strlcpy(config.serverIP, serverIP.c_str(), sizeof(config.serverIP));
+  strlcpy(config.serverPort, serverPort.c_str(), sizeof(config.serverPort));
+  saveConfig();
 
-  // Сохраняем и регистрируем
-  strlcpy(config.sensorId, sensorId.c_str(), sizeof(config.sensorId));
+  // Регистрируем оба датчика
   registerSensor(serverIP, serverPort, authUser, authPass, 
-                sensorId, scaleId, sensorName, locationName);
+                tempSensorId, tempScaleId, sensorName, locationName);
+  
+  registerSensor(serverIP, serverPort, authUser, authPass, 
+                humiditySensorId, humidityScaleId, sensorName, locationName);
 }
 
 
 void sendSensorData() {
-  if (!wifiConnected || strlen(config.sensorId) == 0 || strlen(config.serverIP) == 0) {
+  if (!wifiConnected || strlen(config.tempSensorId) == 0 || 
+      strlen(config.humiditySensorId) == 0 || strlen(config.serverIP) == 0) {
     return;
   }
 
   // Чтение данных с датчика
   float temperature = dht.getTemperature();
+  float humidity = dht.getHumidity();
   
-  if (isnan(temperature)) {
+  if (isnan(temperature) || isnan(humidity)) {
     Serial.println("Ошибка чтения данных с датчика DHT!");
     return;
   }
@@ -348,17 +378,23 @@ void sendSensorData() {
   // Формируем URL для отправки данных
   String readingsUrl = "http://" + String(config.serverIP) + ":" + String(config.serverPort) + "/readings";
 
-  // Формируем JSON тело запроса
+  // Отправляем данные температуры
+  sendSingleReading(readingsUrl, config.tempSensorId, temperature);
+  
+  // Отправляем данные влажности
+  sendSingleReading(readingsUrl, config.humiditySensorId, humidity);
+}
+
+void sendSingleReading(String url, const char* sensorId, float value) {
   DynamicJsonDocument doc(256);
-  doc["sensorId"] = config.sensorId;
-  doc["value"] = temperature;
+  doc["sensorId"] = sensorId;
+  doc["value"] = value;
   
   String payload;
   serializeJson(doc, payload);
 
-  // Отправляем данные на сервер
   HTTPClient http;
-  http.begin(wifiClient, readingsUrl);
+  http.begin(wifiClient, url);
   http.addHeader("Content-Type", "application/json");
   
   int httpCode = http.POST(payload);
@@ -366,9 +402,10 @@ void sendSensorData() {
   http.end();
 
   if (httpCode == HTTP_CODE_OK || httpCode == 201) {
-    Serial.println("Данные успешно отправлены: " + String(temperature) + "°C");
+    Serial.println("Данные успешно отправлены: ID=" + String(sensorId) + ", значение=" + String(value));
   } else {
-    Serial.println("Ошибка отправки данных. Код: " + String(httpCode) + 
+    Serial.println("Ошибка отправки данных. ID=" + String(sensorId) + 
+                 ", Код: " + String(httpCode) + 
                  (response.length() ? ", Ответ: " + response : ""));
   }
 }
