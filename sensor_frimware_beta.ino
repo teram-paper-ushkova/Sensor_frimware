@@ -4,12 +4,15 @@
 #include <WiFiClient.h>
 #include <EEPROM.h>
 #include <ArduinoJson.h>
+#include <DHTesp.h>
 
 // Константы
 #define AP_SSID "ESP_Config"
 #define AP_PASS "12345678"
 #define EEPROM_SIZE 512
-#define DEFAULT_PORT "3000" 
+#define DEFAULT_PORT "3000"
+#define DHT_PIN 4      // Пин к которому подключен датчик DHT
+#define DHT_TYPE DHTesp::DHT11  // Тип датчика (DHT11, DHT21, DHT22) 
 
 // Структура для хранения настроек
 struct Config {
@@ -26,6 +29,10 @@ WiFiClient wifiClient;
 bool wifiConfigured = false;
 bool wifiConnected = false;
 String lastError = "";
+DHTesp dht;
+unsigned long LRT = 0;
+const unsigned long readingInterval = 2000; // Интервал отправки данных (30 секунд)
+
 
 // HTML-страницы
 const char wifiConfigPage[] PROGMEM = R"rawliteral(
@@ -325,9 +332,50 @@ void handleSaveSensor() {
 }
 
 
+void sendSensorData() {
+  if (!wifiConnected || strlen(config.sensorId) == 0 || strlen(config.serverIP) == 0) {
+    return;
+  }
+
+  // Чтение данных с датчика
+  float temperature = dht.getTemperature();
+  
+  if (isnan(temperature)) {
+    Serial.println("Ошибка чтения данных с датчика DHT!");
+    return;
+  }
+
+  // Формируем URL для отправки данных
+  String readingsUrl = "http://" + String(config.serverIP) + ":" + String(config.serverPort) + "/readings";
+
+  // Формируем JSON тело запроса
+  DynamicJsonDocument doc(256);
+  doc["sensorId"] = config.sensorId;
+  doc["value"] = temperature;
+  
+  String payload;
+  serializeJson(doc, payload);
+
+  // Отправляем данные на сервер
+  HTTPClient http;
+  http.begin(wifiClient, readingsUrl);
+  http.addHeader("Content-Type", "application/json");
+  
+  int httpCode = http.POST(payload);
+  String response = httpCode > 0 ? http.getString() : "";
+  http.end();
+
+  if (httpCode == HTTP_CODE_OK || httpCode == 201) {
+    Serial.println("Данные успешно отправлены: " + String(temperature) + "°C");
+  } else {
+    Serial.println("Ошибка отправки данных. Код: " + String(httpCode) + 
+                 (response.length() ? ", Ответ: " + response : ""));
+  }
+}
+
 void setup() {
   Serial.begin(115200);
-  
+  dht.setup(DHT_PIN,DHT_TYPE);
   loadConfig();
   
   if (wifiConfigured) {
@@ -348,4 +396,8 @@ void setup() {
 
 void loop() {
   server.handleClient();
+    if (wifiConnected && millis() - LRT >= readingInterval) {
+    sendSensorData();
+    LRT = millis();
+  }
 }
